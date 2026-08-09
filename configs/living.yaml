@@ -1,0 +1,63 @@
+data:
+    dataset_type: "cached_threedfront"
+    encoding_type: "cached_desc_mtrans_discrete"
+    augmentations: ["fixed_rotation"]
+    dataset_directory: "dataset/InstructScene/threed_front_livingroom"
+    annotation_file: "dataset/livingroom_threed_front_splits.csv"
+    path_to_invalid_scene_ids: "dataset/invalid_threed_front_rooms.txt"
+    path_to_invalid_bbox_jids: "dataset/black_list.txt"
+    path_to_floor_plan_textures: "dataset/floor_plan_texture_images"
+    path_to_pickled_3d_futute_models: "dataset/InstructScene/threed_future_model_livingroom.pkl"
+    filter_fn: "threed_front_livingroom"
+    train_stats: "dataset_stats.txt"
+    room_layout_size: "64,64"
+    max_length: 21
+    t_disc_dim: 64
+    s_disc_dim: 64
+    degree_step: 10    
+
+model:
+    name: "rvq_objfeat_sg_mtrans"
+    text_encoder: "openai/clip-vit-base-patch32"
+    transformer_config:
+        attn_dim: 512
+        n_heads: 8
+        scene_dec_layers: 8
+        triplet_decoder_layers: 2
+        dropout: 0.1 # Original: 0.1
+        cfg_drop_ratio: 0.1 # training
+        cfg_scale: 1.0 # inference
+        masking_probs: [0.1, 0.1, 0.1] # (x,o,l)
+        remasking_probs: [0.88, 0.88, 0.88] # (x,o,l)
+        predict_pad: False
+        triplet_context: "scene" # "text" / "scene"
+        masking_level: "both" # "both" / "object" / "token"
+
+training:
+    splits: ["train", "val"]
+    epochs: 2000
+    batch_size: 256 # ys- train set 개수=621 (gpu 1개)
+    log_frequency: 1
+    optimizer:
+        name: "adamw"
+        lr: 0.0001
+        weight_decay: 0.02
+    scheduler:
+        name: "warmup_cosine"
+        warmup_epochs: 50
+        min_lr: 0.00001
+    loss_weights:
+        x_kl: 1.
+        o_kl: 1.
+        t_kl: 1.
+        r_kl: 1.
+        s_kl: 1.
+        loss_p: 1.
+        loss_s: 1.
+        loss_o: 1.
+    save_frequency: 50
+
+validation:
+    splits: ["test"]
+    batch_size: 128
+    frequency: 50

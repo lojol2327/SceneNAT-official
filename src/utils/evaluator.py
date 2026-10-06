@@ -17,6 +17,21 @@ from src.models import CLIPImageEncoder
 
 from src.utils.collision_metric import get_collision_matrix
 
+import pathlib
+import trimesh
+
+# Vendored SceneEval metrics — self-contained inside SceneNAT (no external
+# ``compare_models`` repo dependency). See src/eval_metrics/.
+from src.eval_metrics import (
+    SceneAdapter,
+    CollisionMetric, CollisionMetricConfig,
+    NavigabilityMetric, NavigabilityMetricConfig,
+    OutOfBoundMetric, OutOfBoundMetricConfig,
+    AccessibilityMetric, AccessibilityMetricConfig,
+    GPT, GPTConfig,
+    PROMPTS_YAML,
+)
+
 class SceneEvaluator:
     """장면 평가를 담당하는 클래스"""
     def __init__(self, 
@@ -65,6 +80,18 @@ class SceneEvaluator:
         self.inter_vol_sum = []
         self.iomin = []
 
+        # Vendored SceneEval / floor-penetration metric accumulators
+        self.nav_scores = []
+        self.nav_components = []
+        self.se_collision_ratios = []
+        self.se_oob_ratios = []
+        self.se_accessibility = []
+        self.floor_pen_ratios = []
+        self.floor_float_ratios = []
+        self.floor_invalid_ratios = []
+        self.floor_pen_depths = []
+        self.floor_float_heights = []
+
         self.num_trip_irecall = {i: [] for i in range(1, self.max_rel_num+1)}
         self.num_trip_irecall_easy = {i: [] for i in range(1, self.max_rel_num+1)}
 
@@ -81,7 +108,17 @@ class SceneEvaluator:
             "time": [],
             "dos": [],
             "dos_fixed": [],
-            "dos_recall": []
+            "dos_recall": [],
+            "floor_pen_ratio": [],
+            "floor_float_ratio": [],
+            "floor_invalid_ratio": [],
+            "floor_pen_depth": [],
+            "floor_float_height": [],
+            "navigability": [],
+            "nav_components": [],
+            "se_collision_ratio": [],
+            "se_oob_ratio": [],
+            "se_accessibility": [],
         }
         self.transparent = False
         self.custom_floor = False
@@ -137,6 +174,41 @@ class SceneEvaluator:
             # self.epoch_metrics["dfs"].append(np.mean(self.mean_dfs))
             # self.mean_dfs = []
             # eval_info += f"DFS: {np.mean(self.mean_dfs)*1000:.4f}\n"
+
+        # Floor-penetration metrics (inline, no external deps)
+        self.epoch_metrics["floor_pen_ratio"].append(np.mean(self.floor_pen_ratios) if self.floor_pen_ratios else 0.0)
+        self.epoch_metrics["floor_float_ratio"].append(np.mean(self.floor_float_ratios) if self.floor_float_ratios else 0.0)
+        self.epoch_metrics["floor_invalid_ratio"].append(np.mean(self.floor_invalid_ratios) if self.floor_invalid_ratios else 0.0)
+        self.epoch_metrics["floor_pen_depth"].append(np.mean(self.floor_pen_depths) if self.floor_pen_depths else 0.0)
+        self.epoch_metrics["floor_float_height"].append(np.mean(self.floor_float_heights) if self.floor_float_heights else 0.0)
+        self.floor_pen_ratios = []
+        self.floor_float_ratios = []
+        self.floor_invalid_ratios = []
+        self.floor_pen_depths = []
+        self.floor_float_heights = []
+        eval_info += (
+            f"Floor Invalid Ratio: {self.epoch_metrics['floor_invalid_ratio'][-1]:.4f} "
+            f"(Pen: {self.epoch_metrics['floor_pen_ratio'][-1]:.4f}, "
+            f"Float: {self.epoch_metrics['floor_float_ratio'][-1]:.4f})\n"
+        )
+        eval_info += f"Floor Pen Depth: {self.epoch_metrics['floor_pen_depth'][-1]:.4f}\n"
+        eval_info += f"Floor Float Height: {self.epoch_metrics['floor_float_height'][-1]:.4f}\n"
+
+        # SceneEval metrics
+        self.epoch_metrics["navigability"].append(np.mean(self.nav_scores) if self.nav_scores else 0.0)
+        self.epoch_metrics["nav_components"].append(np.mean(self.nav_components) if self.nav_components else 0.0)
+        self.epoch_metrics["se_collision_ratio"].append(np.mean(self.se_collision_ratios) if self.se_collision_ratios else 0.0)
+        self.epoch_metrics["se_oob_ratio"].append(np.mean(self.se_oob_ratios) if self.se_oob_ratios else 0.0)
+        self.epoch_metrics["se_accessibility"].append(np.mean(self.se_accessibility) if self.se_accessibility else 0.0)
+        self.nav_scores = []
+        self.nav_components = []
+        self.se_collision_ratios = []
+        self.se_oob_ratios = []
+        self.se_accessibility = []
+        eval_info += f"Navigability: {self.epoch_metrics['navigability'][-1]:.4f} (components: {self.epoch_metrics['nav_components'][-1]:.2f})\n"
+        eval_info += f"SE Collision ratio: {self.epoch_metrics['se_collision_ratio'][-1]:.4f}\n"
+        eval_info += f"SE OOB ratio: {self.epoch_metrics['se_oob_ratio'][-1]:.4f}\n"
+        eval_info += f"SE Accessibility: {self.epoch_metrics['se_accessibility'][-1]:.4f}\n"
 
         # Save evaluation results
         with open(os.path.join(self.save_dir, f"eval_result_epoch_{epoch:03d}.txt"), "w") as f:
@@ -273,19 +345,174 @@ class SceneEvaluator:
             # eval_info += f"DFS: {mean_dfs*1000:.2f}"
             # metrics["mean_dfs"] = mean_dfs
         
-        valid_indices = [i for i in range(len(obj_class_ids)) 
-                        if obj_class_ids[i] != len(self.objects_types)]
-        
+        import matplotlib.pyplot as plt
+        from shapely.geometry import box
+        from shapely import affinity
+
+        valid_indices = [i for i in range(len(obj_class_ids)) if obj_class_ids[i] != len(self.objects_types)]
+
+        scene_pen_count = 0
+        scene_float_count = 0
+        scene_pen_depth_sum = 0.0
+        scene_float_height_sum = 0.0
+
         bbox_data = []
+        floor_status = []
+
         for idx in valid_indices:
-            cx, cy, cz = bbox_params_t_eval[idx, cls_dim:cls_dim+3]
-            sx, sy, sz = bbox_params_t_eval[idx, cls_dim+3:cls_dim+6]
-            theta = bbox_params_t_eval[idx, cls_dim+6]
+            cx, cy, cz = bbox_params_t_eval[idx, cls_dim:cls_dim + 3]
+            sx, sy, sz = bbox_params_t_eval[idx, cls_dim + 3:cls_dim + 6]
+            theta = bbox_params_t_eval[idx, cls_dim + 6]
             bbox_data.append([cx, cy, cz, sx, sy, sz, theta])
-        
+
+            bottom_y = cy - sy
+            eps = 0.01
+
+            if abs(bottom_y) <= 0.2:
+                if bottom_y < -eps:
+                    scene_pen_count += 1
+                    scene_pen_depth_sum += abs(bottom_y)
+                    floor_status.append("red")
+                elif bottom_y > eps:
+                    scene_float_count += 1
+                    scene_float_height_sum += bottom_y
+                    floor_status.append("blue")
+                else:
+                    floor_status.append("green")
+            else:
+                floor_status.append("gray")
+
+        total_objs = len(valid_indices)
+        if total_objs > 0:
+            metrics["floor_pen_ratio"] = scene_pen_count / total_objs
+            metrics["floor_float_ratio"] = scene_float_count / total_objs
+            metrics["floor_invalid_ratio"] = (scene_pen_count + scene_float_count) / total_objs
+        else:
+            metrics["floor_pen_ratio"] = 0.0
+            metrics["floor_float_ratio"] = 0.0
+            metrics["floor_invalid_ratio"] = 0.0
+
+        metrics["floor_pen_depth"] = scene_pen_depth_sum / scene_pen_count if scene_pen_count > 0 else 0.0
+        metrics["floor_float_height"] = scene_float_height_sum / scene_float_count if scene_float_count > 0 else 0.0
+
+        eval_info += (
+            f"Floor Invalid Ratio: {metrics['floor_invalid_ratio']:.4f} "
+            f"(Pen: {metrics['floor_pen_ratio']:.4f}, Float: {metrics['floor_float_ratio']:.4f})\n"
+        )
+        eval_info += f"Floor Pen Depth: {metrics['floor_pen_depth']:.4f}\n"
+        eval_info += f"Floor Float Height: {metrics['floor_float_height']:.4f}\n"
+
         bbox_data = np.array(bbox_data)
-        inter_vol, inter_vol_mean, inter_vol_sum, iomin_score, fig = get_collision_matrix(bbox_data, with_fig=True)
-        
+
+        if len(bbox_data) > 0:
+            fig_floor, ax_floor = plt.subplots(figsize=(10, 10))
+            ax_floor.set_facecolor("#f9f9f9")
+
+            for i in range(len(bbox_data)):
+                cx, _, cz, sx, _, sz, theta = bbox_data[i]
+                poly = box(-sx, -sz, sx, sz)
+                poly_rot = affinity.rotate(poly, theta, origin=(0, 0), use_radians=True)
+                poly_final = affinity.translate(poly_rot, xoff=cx, yoff=-cz)
+
+                color = floor_status[i]
+                alpha = 0.6 if color != "gray" else 0.3
+                ls = "-" if color != "gray" else "--"
+                lw = 2 if color != "gray" else 1
+
+                x, y = poly_final.exterior.xy
+                ax_floor.plot(x, y, color=color, linewidth=lw, linestyle=ls)
+                ax_floor.fill(x, y, color=color, alpha=alpha)
+                ax_floor.text(cx, -cz, str(i), fontsize=9, ha="center", va="center", color="black", fontweight="bold")
+
+            ax_floor.set_xlim(-4, 4)
+            ax_floor.set_ylim(-4, 4)
+            ax_floor.set_aspect("equal")
+            ax_floor.set_xlabel("X axis")
+            ax_floor.set_ylabel("Z axis")
+            ax_floor.set_title(f"Floor Validity Map (Pen: {scene_pen_count}, Float: {scene_float_count})")
+            ax_floor.grid(True, linestyle=":", alpha=0.5)
+            floor_map_path = os.path.join(export_dir, "floor_validity_map.png")
+            fig_floor.savefig(floor_map_path, dpi=300, bbox_inches="tight")
+            plt.close(fig_floor)
+
+        if len(trimesh_meshes) > 0:
+            all_verts = np.concatenate([mesh.vertices for mesh in trimesh_meshes], axis=0)
+            x_min, x_max = all_verts[:, 0].min(), all_verts[:, 0].max()
+            z_min, z_max = all_verts[:, 2].min(), all_verts[:, 2].max()
+            floor_corners = np.array(
+                [
+                    [x_min, 0.0, z_min],
+                    [x_min, 0.0, z_max],
+                    [x_max, 0.0, z_max],
+                    [x_max, 0.0, z_min],
+                ]
+            )
+            se_floor = trimesh.Trimesh(vertices=floor_corners, faces=np.array([[0, 1, 2], [0, 2, 3]]))
+
+            valid_meshes = trimesh_meshes
+            valid_bbox = bbox_params_t_eval[valid_indices]
+            valid_cls_ids = [obj_class_ids[i] for i in valid_indices]
+            valid_model_ids = [obj_ids[i] for i in valid_indices]
+
+            se_scene = SceneAdapter(
+                trimesh_meshes=valid_meshes,
+                bbox_params_valid=valid_bbox,
+                class_ids_valid=valid_cls_ids,
+                obj_model_ids=valid_model_ids,
+                objects_types=self.objects_types,
+                wall_meshes=[se_floor],
+                cls_dim=cls_dim,
+                output_dir=pathlib.Path(export_dir),
+            )
+
+            se_col = CollisionMetric(se_scene, CollisionMetricConfig()).run()
+            n_objs = len(se_scene.get_obj_ids())
+            se_col_ratio = se_col.data["num_obj_in_collision"] / n_objs if n_objs > 0 else 0.0
+            metrics["se_collision_ratio"] = se_col_ratio
+            eval_info += f"SE Collision ratio: {se_col_ratio:.4f}\n"
+
+            se_nav = NavigabilityMetric(
+                se_scene,
+                pathlib.Path(export_dir),
+                NavigabilityMetricConfig(),
+            ).run()
+            metrics["navigability"] = se_nav.data["navigability"]
+            metrics["nav_components"] = se_nav.data["connected_components"]
+            eval_info += (
+                f"Navigability: {se_nav.data['navigability']:.4f} "
+                f"(components: {se_nav.data['connected_components']})\n"
+            )
+
+            se_oob = OutOfBoundMetric(se_scene, OutOfBoundMetricConfig()).run()
+            n_oob = sum(1 for s in se_oob.data.values() if s["out_of_bound"])
+            se_oob_ratio = n_oob / n_objs if n_objs > 0 else 0.0
+            metrics["se_oob_ratio"] = se_oob_ratio
+            eval_info += f"SE OOB ratio: {se_oob_ratio:.4f}\n"
+
+            try:
+                prompt_file = PROMPTS_YAML
+                vlm = GPT(GPTConfig(prompt_file=str(prompt_file)))
+                se_acc = AccessibilityMetric(
+                    se_scene,
+                    vlm,
+                    pathlib.Path(export_dir),
+                    AccessibilityMetricConfig(
+                        image_resolution=256,
+                        scale_margin=0.2,
+                        obj_height_threshold=2.0,
+                        access_area_width=0.6,
+                        access_area_offset=0.1,
+                    ),
+                ).run()
+                acc_scores = [score["max"] for score in se_acc.data.values() if score["max"] >= 0]
+                metrics["se_accessibility"] = np.mean(acc_scores) if acc_scores else 0.0
+                eval_info += f"SE Accessibility: {metrics['se_accessibility']:.4f}\n"
+            except Exception as e:
+                print(f"Failed to run VLM metrics: {e}")
+                metrics["se_accessibility"] = 0.0
+
+        inter_vol, inter_vol_mean, inter_vol_sum, iomin_score, _ = get_collision_matrix(bbox_data, with_fig=True)
+
         metrics["inter_mean"] = inter_vol_mean
         metrics["inter_sum"] = inter_vol_sum
         metrics["iomin"] = iomin_score
@@ -349,6 +576,23 @@ class SceneEvaluator:
         self.inter_vol_mean.append(scene_results["inter_mean"])
         self.inter_vol_sum.append(scene_results["inter_sum"])
         self.iomin.append(scene_results["iomin"])
+
+        # SceneEval metrics (only present when the scene produced meshes)
+        if "navigability" in scene_results:
+            self.nav_scores.append(scene_results["navigability"])
+            self.nav_components.append(scene_results["nav_components"])
+            self.se_collision_ratios.append(scene_results["se_collision_ratio"])
+            self.se_oob_ratios.append(scene_results.get("se_oob_ratio", 0.0))
+            self.se_accessibility.append(scene_results.get("se_accessibility", 0.0))
+
+        # Floor-penetration metrics
+        self.floor_pen_ratios.append(scene_results["floor_pen_ratio"])
+        self.floor_float_ratios.append(scene_results["floor_float_ratio"])
+        self.floor_invalid_ratios.append(scene_results["floor_invalid_ratio"])
+        if scene_results["floor_pen_depth"] > 0:
+            self.floor_pen_depths.append(scene_results["floor_pen_depth"])
+        if scene_results["floor_float_height"] > 0:
+            self.floor_float_heights.append(scene_results["floor_float_height"])
 
         if self.dfs:
             self.mean_dos.append(scene_results["mean_dos"])
@@ -595,6 +839,17 @@ class SceneEvaluator:
             f.write(f"DOS (std): {stat_dict['dos']*1000:.2f} ({stat_dict['dos_std']*1000:.2f})\n")
             f.write(f"DOS_fixed (std): {stat_dict['dos_fixed']*1000:.2f} ({stat_dict['dos_fixed_std']*1000:.2f})\n")
             f.write(f"DOS_recall (std): {stat_dict['dos_recall']*1000:.2f} ({stat_dict['dos_recall_std']*1000:.2f})\n")
+
+            f.write(f"Floor Invalid Ratio (std): {stat_dict['floor_invalid_ratio']:.4f} ({stat_dict['floor_invalid_ratio_std']:.4f})\n")
+            f.write(f"Floor Pen Ratio (std): {stat_dict['floor_pen_ratio']:.4f} ({stat_dict['floor_pen_ratio_std']:.4f})\n")
+            f.write(f"Floor Float Ratio (std): {stat_dict['floor_float_ratio']:.4f} ({stat_dict['floor_float_ratio_std']:.4f})\n")
+            f.write(f"Floor Pen Depth (std): {stat_dict['floor_pen_depth']:.4f} ({stat_dict['floor_pen_depth_std']:.4f})\n")
+            f.write(f"Floor Float Height (std): {stat_dict['floor_float_height']:.4f} ({stat_dict['floor_float_height_std']:.4f})\n")
+            f.write(f"Navigability (std): {stat_dict['navigability']:.4f} ({stat_dict['navigability_std']:.4f})\n")
+            f.write(f"Nav Components (std): {stat_dict['nav_components']:.2f} ({stat_dict['nav_components_std']:.2f})\n")
+            f.write(f"SE Collision Ratio (std): {stat_dict['se_collision_ratio']:.4f} ({stat_dict['se_collision_ratio_std']:.4f})\n")
+            f.write(f"SE OOB Ratio (std): {stat_dict['se_oob_ratio']:.4f} ({stat_dict['se_oob_ratio_std']:.4f})\n")
+            f.write(f"SE Accessibility (std): {stat_dict['se_accessibility']:.4f} ({stat_dict['se_accessibility_std']:.4f})\n")
             
             # Write num_trip_irecall statistics
             f.write("\nTriplet-wise Relation Accuracy (std):\n")

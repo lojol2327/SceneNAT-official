@@ -16,3 +16,6 @@ blender/
 .vscode/
 .idea/
 .DS_Store
+
+# SceneEval accessibility SIZE_REFERENCE human figure (not needed for metrics; 48MB)
+src/eval_metrics/assets/*.glb

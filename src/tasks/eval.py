@@ -228,8 +228,6 @@ def main():
                 
                 progress_bar = tqdm(total=len(bbox_params_t), desc="Visualize each scene", ncols=125)
                 for i in range(len(bbox_params_t)):
-                    if int(epoch*len(dataset)+batch_idx*B+i) != 22:
-                        continue
                     # scene id
                     scene_id = f"{epoch*len(dataset)+batch_idx*B+i:04d}@{batch['scene_uids'][i]}"
 

@@ -138,7 +138,7 @@ class SceneNAT_triplet(nn.Module):
         
         self.criterion = SetCriterion(
             matcher=self.matcher,
-            eos_coef=0.05,
+            eos_coef=0.1,
             num_classes={'p': n_predicate_types + 1}
         )
 

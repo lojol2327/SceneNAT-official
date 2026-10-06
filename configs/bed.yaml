@@ -12,8 +12,8 @@ data:
     train_stats: "dataset_stats.txt"
     room_layout_size: "64,64"
     max_length: 12
-    t_disc_dim: 32
-    s_disc_dim: 32
+    t_disc_dim: 64
+    s_disc_dim: 64
     degree_step: 10
 
 model:
